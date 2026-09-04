@@ -50,7 +50,8 @@ type session struct {
 	closeErr  error
 	done      chan struct{}
 
-	client *Client
+	client   *Client
+	keepOnce atomic.Bool
 
 	service          *Service
 	serviceContext   context.Context

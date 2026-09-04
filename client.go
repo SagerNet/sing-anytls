@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing/common"
@@ -15,6 +16,17 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/x/list"
 )
+
+type keepSessionKey struct{}
+
+func ContextWithKeepSession(ctx context.Context) context.Context {
+	return context.WithValue(ctx, (*keepSessionKey)(nil), true)
+}
+
+func keepSessionFromContext(ctx context.Context) bool {
+	keep, _ := ctx.Value((*keepSessionKey)(nil)).(bool)
+	return keep
+}
 
 type ClientOptions struct {
 	Password                 string
@@ -38,6 +50,7 @@ type Client struct {
 	idleTimeout       time.Duration
 	minIdleSession    int
 	disableReuse      bool
+	closeIdle         atomic.Bool
 
 	access       sync.Mutex
 	closed       bool
@@ -88,10 +101,14 @@ func (c *Client) DialContext(ctx context.Context, destination M.Socksaddr) (net.
 	if len(destination.Fqdn) > 255 {
 		return nil, E.New("anytls: domain too long: ", destination.Fqdn)
 	}
+	keepSession := keepSessionFromContext(ctx)
 	idle := c.takeIdleSession()
 	if idle != nil {
 		opened, err := idle.openStream(destination)
 		if err == nil && !idle.IsClosed() {
+			if keepSession {
+				idle.keepOnce.Store(true)
+			}
 			return opened, nil
 		}
 		if opened != nil {
@@ -107,6 +124,9 @@ func (c *Client) DialContext(ctx context.Context, destination M.Socksaddr) (net.
 	if err != nil {
 		created.Close()
 		return nil, err
+	}
+	if keepSession {
+		created.keepOnce.Store(true)
 	}
 	return opened, nil
 }
@@ -163,13 +183,13 @@ func (c *Client) takeIdleSession() *session {
 	if c.closed {
 		return nil
 	}
-	element := c.idleSessions.Front()
-	if element == nil {
-		return nil
+	for element := c.idleSessions.Front(); element != nil; element = element.Next() {
+		idle := element.Value
+		c.idleSessions.Remove(element)
+		idle.element = nil
+		return idle
 	}
-	idle := c.idleSessions.Remove(element)
-	idle.element = nil
-	return idle
+	return nil
 }
 
 func (c *Client) releaseSession(released *session) {
@@ -178,13 +198,24 @@ func (c *Client) releaseSession(released *session) {
 		return
 	}
 	c.access.Lock()
-	defer c.access.Unlock()
 	if released.IsClosed() || c.closed {
 		if released.element != nil {
 			c.idleSessions.Remove(released.element)
 			released.element = nil
 		}
 		delete(c.sessions, released)
+		c.access.Unlock()
+		return
+	}
+	keepOnce := released.keepOnce.Swap(false)
+	if !released.hasStreams() && c.closeIdle.Load() && !keepOnce {
+		if released.element != nil {
+			c.idleSessions.Remove(released.element)
+			released.element = nil
+		}
+		delete(c.sessions, released)
+		c.access.Unlock()
+		released.Close()
 		return
 	}
 	if released.element == nil {
@@ -193,6 +224,57 @@ func (c *Client) releaseSession(released *session) {
 		if c.idleTimer == nil {
 			c.idleTimer = time.AfterFunc(c.idleCheckInterval, c.cleanupIdleSessions)
 		}
+	}
+	c.access.Unlock()
+}
+
+func (c *Client) SetKeepIdleConnections(keep bool) {
+	c.closeIdle.Store(!keep)
+	if !keep {
+		c.CloseIdleConnections()
+	}
+}
+
+func (c *Client) CloseIdleConnections() {
+	c.access.Lock()
+	if c.closed {
+		c.access.Unlock()
+		return
+	}
+	var closing []*session
+	for idle := range c.sessions {
+		if idle.hasStreams() {
+			continue
+		}
+		if idle.element != nil {
+			c.idleSessions.Remove(idle.element)
+			idle.element = nil
+		}
+		delete(c.sessions, idle)
+		closing = append(closing, idle)
+	}
+	c.access.Unlock()
+	for _, idle := range closing {
+		idle.Close()
+	}
+}
+
+func (c *Client) Reset() {
+	c.access.Lock()
+	if c.closed {
+		c.access.Unlock()
+		return
+	}
+	sessions := make([]*session, 0, len(c.sessions))
+	for closing := range c.sessions {
+		closing.element = nil
+		sessions = append(sessions, closing)
+	}
+	clear(c.sessions)
+	c.idleSessions.Init()
+	c.access.Unlock()
+	for _, closing := range sessions {
+		closing.Close()
 	}
 }
 
