@@ -37,12 +37,22 @@ type ClientOptions struct {
 	MinIdleSession           int
 	DisableReuse             bool
 	Logger                   logger.ContextLogger
+	// AdmitCreation, when set, is called exactly once per NEW session and never when an idle
+	// session is reused. It OWNS the call: it must invoke create exactly once and return its
+	// error (a hook that refuses must return its own error without calling create).
+	//
+	// The hook exists because the two paths have different costs. Creating a session pays a TCP
+	// connect, a TLS handshake and the first write; reusing an idle session pays one frame. A
+	// caller that bounds session creation must therefore be consulted at THIS seam, after the
+	// reuse attempt has failed, or a healthy reuse would wait behind creations it is unrelated to.
+	AdmitCreation func(ctx context.Context, create func(context.Context) error) error
 }
 
 type Client struct {
 	password       [passwordLen]byte
 	clientMetadata string
 	dialOut        DialOutFunc
+	admitCreation  func(ctx context.Context, create func(context.Context) error) error
 	logger         logger.ContextLogger
 	padding        common.TypedValue[*paddingFactory]
 
@@ -68,6 +78,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		password:          sha256.Sum256([]byte(options.Password)),
 		clientMetadata:    options.ClientMetadata,
 		dialOut:           options.DialOut,
+		admitCreation:     options.AdmitCreation,
 		logger:            options.Logger,
 		idleCheckInterval: options.IdleSessionCheckInterval,
 		idleTimeout:       options.IdleSessionTimeout,
@@ -125,7 +136,26 @@ func (c *Client) DialContext(ctx context.Context, destination M.Socksaddr) (net.
 	return opened, nil
 }
 
+// createSession builds a new session. Admission is asked HERE, after the idle-reuse attempt in
+// DialContext has already failed: a caller that bounds creation must not be charged for a reuse,
+// and the hook must see the real creation (dial, handshake and first write), not a stream open.
 func (c *Client) createSession(ctx context.Context) (*session, error) {
+	if c.admitCreation == nil {
+		return c.createSessionDirect(ctx)
+	}
+	var created *session
+	err := c.admitCreation(ctx, func(ctx context.Context) error {
+		var createErr error
+		created, createErr = c.createSessionDirect(ctx)
+		return createErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	return created, nil
+}
+
+func (c *Client) createSessionDirect(ctx context.Context) (*session, error) {
 	c.access.Lock()
 	closed := c.closed
 	c.access.Unlock()
